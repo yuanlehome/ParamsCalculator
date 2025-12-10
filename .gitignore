@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+.trae/
+
+# Datasets and cache
+datasets/*/.msc/
+datasets/*/._____temp/
+datasets/*/.DS_Store
+
+# Logs
+logs/
+

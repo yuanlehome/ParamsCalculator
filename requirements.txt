@@ -1,0 +1,6 @@
+streamlit>=1.31.0
+modelscope>=1.13.0
+pandas>=2.0.0
+plotly>=5.15.0
+accelerate>=0.27.0
+transformers>=4.57.0

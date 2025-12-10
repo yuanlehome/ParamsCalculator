@@ -1,509 +1,21 @@
-import os
-import re
 import time
-from typing import Any, Dict, Tuple
-
-import pandas as pd
 import plotly.express as px
 import streamlit as st
-from modelscope import AutoConfig, AutoModel
+import pandas as pd
+from params_calculator.common import format_number, get_dtype_size
+from params_calculator.memory import estimate_vram, estimate_kv_cache
+from params_calculator.analysis import analyze_model_structure
 
 # --- 页面配置 ---
-st.set_page_config(page_title="ModelScope Model Params Calculator", page_icon="🧮", layout="wide")
+st.set_page_config(
+    page_title="ModelScope Model Params Calculator", page_icon="🧮", layout="wide"
+)
 
 
 # --- 核心逻辑函数 ---
-def format_number(num: int) -> str:
-    """将数字格式化为 B (Billion) 或 M (Million)"""
-    if num >= 1_000_000_000:
-        return f"{num / 1_000_000_000:.2f} B"
-    elif num >= 1_000_000:
-        return f"{num / 1_000_000:.2f} M"
-    else:
-        return f"{num:,}"
-
-
-def estimate_vram(param_count: int) -> Dict[str, str]:
-    """估算不同精度下的权重显存占用"""
-
-    def bytes_to_gb(b):
-        return f"{b / (1024 ** 3):.2f} GB"
-
-    return {
-        "FP32 (4 bytes)": bytes_to_gb(param_count * 4),
-        "FP16/BF16 (2 bytes)": bytes_to_gb(param_count * 2),
-        "Int8 (1 byte)": bytes_to_gb(param_count * 1),
-        "Int4 (0.5 byte)": bytes_to_gb(param_count * 0.5),
-    }
-
-
-def estimate_kv_cache(model_config, context_length=2048, batch_size=1, dtype="fp16", tp=1):
-    """估算 KV Cache 显存占用"""
-    num_layers = getattr(model_config, "num_hidden_layers", -1)
-    num_heads = getattr(model_config, "num_key_value_heads", -1)
-    hidden_size = getattr(model_config, "hidden_size", -1)
-    head_dim = getattr(model_config, "head_dim", -1)
-
-    if num_heads < 0 or hidden_size < 0:
-        return "0.00 GB", {}
-    if head_dim < 0:
-        head_dim = hidden_size // num_heads
-
-    dtype_size = {"fp32": 4, "fp16": 2, "bf16": 2, "fp8": 1, "int8": 1, "int4": 0.5}.get(dtype.lower(), 2)
-
-    # 计算公式步骤
-    calculation_steps = {
-        "层数": num_layers,
-        "注意力头数": num_heads,
-        "每个头的维度": head_dim,
-        "上下文长度": context_length,
-        "批大小": batch_size,
-        "数据类型字节数": dtype_size,
-        "KV向量数": 2,  # Key和Value
-        "张量并行度": tp,
-    }
-
-    # 计算公式：layers × heads × head_dim × context_length × 2 (K+V) × batch_size × dtype_size / tp
-    kv_cache_bytes = num_layers * num_heads * head_dim * context_length * 2 * batch_size * dtype_size
-    kv_cache_bytes /= tp
-
-    return f"{kv_cache_bytes / (1024 ** 3):.2f} GB", calculation_steps
-
-
-def extract_layer_index(name: str) -> int:
-    """提取层编号用于排序"""
-    match = re.search(r"layers.(\d+)", name)
-    return int(match.group(1)) if match else -1
-
-
-def identify_param_type(name: str) -> str:
-    """识别关键参数类型"""
-    name_lower = name.lower()
-    if "embedding" in name_lower:
-        return "embedding"
-    elif any(k in name_lower for k in ["q_proj", "k_proj", "v_proj", "attn", "attention"]):
-        return "attention"
-    elif (
-        "mlp" in name_lower
-        or "fc" in name_lower
-        or "gate" in name_lower
-        or "up_proj" in name_lower
-        or "down_proj" in name_lower
-    ):
-        return "mlp"
-    elif "norm" in name_lower or "ln" in name_lower:
-        return "norm"
-    elif "lm_head" in name_lower or "head" in name_lower:
-        return "head"
-    else:
-        return "other"
-
-
-def get_dtype_size(dtype: str) -> float:
-    """获取数据类型对应的字节数"""
-    dtype_map = {"fp32": 4, "fp16": 2, "bf16": 2, "fp8": 1, "int8": 1, "int4": 0.5}
-    return dtype_map.get(dtype.lower(), 2)
-
-
-def calculate_model_params_detail(config):
-    """计算模型参数量的详细公式，支持Dense和MoE模型"""
-    details = {}
-    formulas = []
-
-    try:
-        model_type = getattr(config, "model_type", "unknown").lower()
-        vocab_size = getattr(config, "vocab_size", 0)
-        hidden_size = getattr(config, "hidden_size", 0)
-        num_layers = getattr(config, "num_hidden_layers", 0)
-        num_attention_heads = getattr(config, "num_attention_heads", 0)
-        intermediate_size = getattr(config, "intermediate_size", 0)
-
-        # MoE 相关参数
-        num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", 0))
-        num_experts_per_tok = getattr(config, "num_experts_per_tok", getattr(config, "top_k", 0))
-        expert_intermediate_size = getattr(
-            config, "expert_intermediate_size", getattr(config, "ffn_hidden_size", intermediate_size)
-        )
-
-        # 判断是否是MoE模型
-        is_moe_model = num_experts > 0
-        if is_moe_model:
-            model_type_with_moe = f"{model_type} (MoE)"
-        else:
-            model_type_with_moe = f"{model_type} (Dense)"
-
-        # 存储基础信息
-        details["基础信息"] = {
-            "模型类型": model_type_with_moe,
-            "词表大小": vocab_size,
-            "隐藏层维度": hidden_size,
-            "层数": num_layers,
-            "注意力头数": num_attention_heads,
-            "中间层维度": intermediate_size,
-            "是否MoE": "是" if is_moe_model else "否",
-        }
-
-        if is_moe_model:
-            details["基础信息"]["专家数量"] = num_experts
-            details["基础信息"]["每token专家数"] = num_experts_per_tok
-            details["基础信息"]["专家中间层维度"] = expert_intermediate_size
-
-        # Transformer类模型通用计算公式
-        if (
-            "llama" in model_type
-            or "qwen" in model_type
-            or "deepseek" in model_type
-            or "ernie" in model_type
-            or "mixtral" in model_type
-        ):
-            total_params = 0
-
-            # 1. Embedding 参数
-            embedding_params = vocab_size * hidden_size
-            total_params += embedding_params
-            formulas.append("### 1. Embedding 层参数")
-            formulas.append("词表大小 × 隐藏层维度")
-            formulas.append(
-                f"{format_number(vocab_size)} × {format_number(hidden_size)} = **{format_number(embedding_params)}**"
-            )
-
-            # 2. Attention 参数（每层）
-            head_dim = hidden_size // num_attention_heads
-
-            # QKV投影参数
-            qkv_params_per_layer = (hidden_size * hidden_size) * 3  # Q, K, V 投影矩阵
-            # Output投影参数
-            output_proj_params = hidden_size * hidden_size
-
-            attention_params_per_layer = qkv_params_per_layer + output_proj_params
-
-            formulas.append("\n### 2. Attention 层参数（每层）")
-            formulas.append("#### a) QKV投影 (Q, K, V 各一个线性层)")
-            formulas.append("隐藏层维度 × 隐藏层维度 × 3")
-            formulas.append(
-                f"{format_number(hidden_size)} × {format_number(hidden_size)} × 3 = **{format_number(qkv_params_per_layer)}**"
-            )
-
-            formulas.append("\n#### b) Output投影")
-            formulas.append("隐藏层维度 × 隐藏层维度")
-            formulas.append(
-                f"{format_number(hidden_size)} × {format_number(hidden_size)} = **{format_number(output_proj_params)}**"
-            )
-
-            formulas.append("\n#### c) 每层Attention总参数")
-            formulas.append("QKV投影 + Output投影")
-            formulas.append(
-                f"{format_number(qkv_params_per_layer)} + {format_number(output_proj_params)} = **{format_number(attention_params_per_layer)}**"
-            )
-
-            # 3. MLP/FFN 参数（每层）
-            mlp_params_per_layer = 0
-            mlp_calculation = []
-
-            if intermediate_size > 0 or expert_intermediate_size > 0:
-                if is_moe_model:
-                    # MoE 模型计算
-                    formulas.append("\n### 3. MoE层参数（每层）")
-
-                    # 门控网络参数（gate或router）
-                    gate_params = hidden_size * num_experts
-                    mlp_params_per_layer += gate_params
-                    mlp_calculation.append(
-                        f"Gate网络: {format_number(hidden_size)} × {num_experts} = {format_number(gate_params)}"
-                    )
-
-                    # 每个专家：gate_proj + up_proj + down_proj
-                    expert_params_per_layer = (hidden_size * expert_intermediate_size) * 2 + (
-                        expert_intermediate_size * hidden_size
-                    )
-                    mlp_calculation.append("每个专家参数: gate_proj + up_proj + down_proj")
-                    mlp_calculation.append(
-                        f"  = ({format_number(hidden_size)} × {format_number(expert_intermediate_size)} × 2) + ({format_number(expert_intermediate_size)} × {format_number(hidden_size)})"
-                    )
-                    mlp_calculation.append(f"  = {format_number(expert_params_per_layer)}")
-
-                    # 所有专家总参数
-                    all_experts_params = expert_params_per_layer * num_experts
-                    mlp_params_per_layer += all_experts_params
-                    mlp_calculation.append(
-                        f"所有{num_experts}个专家总参数: {format_number(expert_params_per_layer)} × {num_experts} = {format_number(all_experts_params)}"
-                    )
-
-                    formulas.extend(mlp_calculation)
-
-                    # MoE激活参数（每个token实际激活的参数）
-                    active_params_per_layer = gate_params + (expert_params_per_layer * num_experts_per_tok)
-                    formulas.append("\n#### d) 每token激活的MoE参数（推理时）")
-                    formulas.append(f"Gate参数 + (每个专家参数 × {num_experts_per_tok}个激活专家)")
-                    formulas.append(
-                        f"{format_number(gate_params)} + ({format_number(expert_params_per_layer)} × {num_experts_per_tok}) = **{format_number(active_params_per_layer)}**"
-                    )
-
-                    details["MoE信息"] = {
-                        "每层总MoE参数": mlp_params_per_layer,
-                        "每个专家参数": expert_params_per_layer,
-                        "每token激活参数": active_params_per_layer,
-                        "稀疏性": f"{(num_experts_per_tok / num_experts * 100):.1f}%",
-                    }
-
-                else:
-                    # Dense架构：gate_proj + up_proj + down_proj
-                    mlp_params_per_layer = (hidden_size * intermediate_size) * 2 + (intermediate_size * hidden_size)
-
-                    formulas.append("\n### 3. MLP层参数（每层）- Llama架构")
-                    formulas.append("#### a) gate_proj + up_proj")
-                    formulas.append("隐藏层维度 × 中间层维度 × 2")
-                    formulas.append(
-                        f"{format_number(hidden_size)} × {format_number(intermediate_size)} × 2 = **{format_number(hidden_size * intermediate_size * 2)}**"
-                    )
-
-                    formulas.append("\n#### b) down_proj")
-                    formulas.append("中间层维度 × 隐藏层维度")
-                    formulas.append(
-                        f"{format_number(intermediate_size)} × {format_number(hidden_size)} = **{format_number(intermediate_size * hidden_size)}**"
-                    )
-
-                    formulas.append("\n#### c) 每层MLP总参数")
-                    formulas.append(f"{format_number(mlp_params_per_layer)}")
-
-            # 4. LayerNorm 参数（每层）
-            # 两个LayerNorm：attention之前的和MLP之前的
-            # 每个LayerNorm：gamma (hidden_size) + beta (hidden_size)
-            norm_params_per_layer = hidden_size * 2 * 2  # 2个LayerNorm，每个2个参数
-
-            formulas.append("\n### 4. LayerNorm 参数（每层）")
-            formulas.append("隐藏层维度 × 2（gamma和beta）× 2（pre-attention和pre-MLP）")
-            formulas.append(f"{format_number(hidden_size)} × 2 × 2 = **{format_number(norm_params_per_layer)}**")
-
-            # 5. 每层总参数
-            if is_moe_model:
-                # MoE模型：每层参数 = Attention + MoE + LayerNorm
-                params_per_layer = attention_params_per_layer + mlp_params_per_layer + norm_params_per_layer
-                active_params_per_layer = (
-                    attention_params_per_layer + details["MoE信息"]["每token激活参数"] + norm_params_per_layer
-                )
-
-                formulas.append("\n### 5. 每层总参数 (MoE模型)")
-                formulas.append("#### a) 总参数（包含所有专家）")
-                formulas.append("Attention + MoE(所有专家) + LayerNorm")
-                formulas.append(
-                    f"{format_number(attention_params_per_layer)} + {format_number(mlp_params_per_layer)} + {format_number(norm_params_per_layer)} = **{format_number(params_per_layer)}**"
-                )
-
-                formulas.append("\n#### b) 激活参数（每token实际使用）")
-                formulas.append("Attention + MoE(激活专家) + LayerNorm")
-                formulas.append(
-                    f"{format_number(attention_params_per_layer)} + {format_number(details['MoE信息']['每token激活参数'])} + {format_number(norm_params_per_layer)} = **{format_number(active_params_per_layer)}**"
-                )
-
-                # 存储MoE激活参数
-                details["MoE信息"]["每层激活参数"] = active_params_per_layer
-            else:
-                # Dense模型
-                params_per_layer = attention_params_per_layer + mlp_params_per_layer + norm_params_per_layer
-
-                formulas.append("\n### 5. 每层总参数")
-                formulas.append("Attention + MLP + LayerNorm")
-                formulas.append(
-                    f"{format_number(attention_params_per_layer)} + {format_number(mlp_params_per_layer)} + {format_number(norm_params_per_layer)} = **{format_number(params_per_layer)}**"
-                )
-
-            # 6. 所有层参数
-            all_layers_params = params_per_layer * num_layers
-            total_params += all_layers_params
-
-            if is_moe_model:
-                # MoE模型的激活参数总量
-                all_active_params = active_params_per_layer * num_layers
-                formulas.append(f"\n### 6. 所有{num_layers}层总参数 (MoE模型)")
-                formulas.append("#### a) 总参数（包含所有专家）")
-                formulas.append("每层总参数 × 层数")
-                formulas.append(
-                    f"{format_number(params_per_layer)} × {num_layers} = **{format_number(all_layers_params)}**"
-                )
-
-                formulas.append("\n#### b) 激活参数总量（每token实际使用）")
-                formulas.append("每层激活参数 × 层数")
-                formulas.append(
-                    f"{format_number(active_params_per_layer)} × {num_layers} = **{format_number(all_active_params)}**"
-                )
-
-                details["MoE信息"]["总激活参数"] = all_active_params
-            else:
-                formulas.append(f"\n### 6. 所有{num_layers}层总参数")
-                formulas.append("每层参数 × 层数")
-                formulas.append(
-                    f"{format_number(params_per_layer)} × {num_layers} = **{format_number(all_layers_params)}**"
-                )
-
-            # 7. 输出层 (LM Head) 参数
-            lm_head_params = hidden_size * vocab_size
-            total_params += lm_head_params
-
-            formulas.append("\n### 7. 输出层 (LM Head) 参数")
-            formulas.append("隐藏层维度 × 词表大小")
-            formulas.append(
-                f"{format_number(hidden_size)} × {format_number(vocab_size)} = **{format_number(lm_head_params)}**"
-            )
-
-            # 8. 最终总计
-            if is_moe_model:
-                formulas.append("\n### 8. 模型总参数量 (MoE模型)")
-                formulas.append("#### a) 总参数（包含所有专家）")
-                formulas.append("Embedding + 所有层(总) + LM Head")
-                formulas.append(
-                    f"{format_number(embedding_params)} + {format_number(all_layers_params)} + {format_number(lm_head_params)} = **{format_number(total_params)}**"
-                )
-
-                # MoE模型的激活参数总量（推理时）
-                total_active_params = embedding_params + all_active_params + lm_head_params
-                formulas.append("\n#### b) 激活参数总量（每token实际使用）")
-                formulas.append("Embedding + 所有层(激活) + LM Head")
-                formulas.append(
-                    f"{format_number(embedding_params)} + {format_number(all_active_params)} + {format_number(lm_head_params)} = **{format_number(total_active_params)}**"
-                )
-
-                # 计算稀疏率和激活参数比例
-                sparsity = (1 - (total_active_params / total_params)) * 100
-                formulas.append("\n#### c) 稀疏率")
-                formulas.append("1 - (激活参数 / 总参数)")
-                formulas.append(
-                    f"1 - ({format_number(total_active_params)} / {format_number(total_params)}) = **{sparsity:.1f}%**"
-                )
-
-                # 存储MoE相关计算结果
-                details["详细计算"] = {
-                    "Embedding参数": embedding_params,
-                    "每层Attention参数": attention_params_per_layer,
-                    "每层MoE总参数": mlp_params_per_layer,
-                    "每层激活MoE参数": details["MoE信息"]["每token激活参数"] if is_moe_model else 0,
-                    "每层LayerNorm参数": norm_params_per_layer,
-                    "每层总参数": params_per_layer,
-                    "每层激活参数": active_params_per_layer if is_moe_model else params_per_layer,
-                    "所有层总参数": all_layers_params,
-                    "所有层激活参数": all_active_params if is_moe_model else all_layers_params,
-                    "LM Head参数": lm_head_params,
-                    "总计（含所有专家）": total_params,
-                    "总计（激活参数）": total_active_params if is_moe_model else total_params,
-                    "稀疏率": f"{sparsity:.1f}%",
-                }
-            else:
-                formulas.append("\n### 8. 模型总参数量")
-                formulas.append("Embedding + 所有层 + LM Head")
-                formulas.append(
-                    f"{format_number(embedding_params)} + {format_number(all_layers_params)} + {format_number(lm_head_params)} = **{format_number(total_params)}**"
-                )
-
-                # 存储详细计算结果
-                details["详细计算"] = {
-                    "Embedding参数": embedding_params,
-                    "每层Attention参数": attention_params_per_layer,
-                    "每层MLP参数": mlp_params_per_layer,
-                    "每层LayerNorm参数": norm_params_per_layer,
-                    "每层总参数": params_per_layer,
-                    "所有层总参数": all_layers_params,
-                    "LM Head参数": lm_head_params,
-                    "总计": total_params,
-                }
-
-            details["公式"] = formulas
-
-        else:
-            formulas.append(f"模型类型 '{model_type}' 的详细计算公式未实现")
-            details["公式"] = formulas
-
-    except Exception as e:
-        formulas.append(f"计算详细公式时出错: {str(e)}")
-        details["公式"] = formulas
-
-    return details
-
-
 @st.cache_data(show_spinner=False)
-def analyze_model_structure(model_id: str, trust_remote_code: bool) -> Tuple[bool, Any, pd.DataFrame, str, Any]:
-    """
-    下载 Config 并实例化 Meta Model，统计参数。
-    返回: (是否成功, 统计信息字典, 详细参数DataFrame, 错误信息, config对象)
-    """
-    try:
-        # 设置缓存路径
-        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "modelscope", "hub")
-        os.makedirs(cache_dir, exist_ok=True)
-
-        # 从ModelScope加载配置
-        try:
-            config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code, cache_dir=cache_dir)
-            st.success(f"✅ 成功从ModelScope加载配置: {model_id}")
-        except Exception as e:
-            return False, None, None, f"ModelScope配置加载失败: {str(e)}", None
-
-        # 计算详细公式
-        detail_calculation = calculate_model_params_detail(config)
-
-        # 尝试加载模型结构（使用meta tensor）
-        try:
-            from accelerate import init_empty_weights
-
-            with init_empty_weights():
-                model = AutoModel.from_config(config, trust_remote_code=trust_remote_code)
-        except ImportError:
-            # 如果accelerate不可用，尝试直接加载但捕获错误
-            st.warning("⚠️ accelerate库未安装，使用普通方式加载（可能消耗更多内存）")
-            try:
-                model = AutoModel.from_config(config, trust_remote_code=trust_remote_code)
-            except Exception as e:
-                return False, None, None, f"模型结构初始化失败（无meta tensor）: {str(e)}", None
-
-        total_params = 0
-        trainable_params = 0
-        param_data = []
-
-        for name, param in model.named_parameters():
-            num_params = param.numel()
-            total_params += num_params
-            if param.requires_grad:
-                trainable_params += num_params
-
-            param_data.append(
-                {
-                    "Full Name": name,
-                    "Group": name.split(".")[0] if len(name.split(".")) > 0 else "base",
-                    "SubGroup": name.split(".")[1] if len(name.split(".")) > 1 else "other",
-                    "Shape": str(tuple(param.shape)),
-                    "Count": num_params,
-                    "Dtype": str(param.dtype).replace("torch.", ""),
-                    "LayerIdx": extract_layer_index(name),
-                    "ParamType": identify_param_type(name),
-                }
-            )
-
-        df_params = pd.DataFrame(param_data)
-
-        # 使用详细计算中的总计，或者使用统计的总计
-        calculated_total = detail_calculation.get("详细计算", {}).get("总计", 0)
-        if calculated_total > 0:
-            final_total = calculated_total
-        else:
-            final_total = total_params
-
-        info = {
-            "model_type": getattr(config, "model_type", "unknown"),
-            "total_params": final_total,
-            "trainable_params": trainable_params,
-            "architectures": getattr(config, "architectures", ["Unknown"]),
-            "vocab_size": getattr(config, "vocab_size", "N/A"),
-            "hidden_size": getattr(config, "hidden_size", "N/A"),
-            "num_layers": getattr(config, "num_hidden_layers", 0),
-            "num_heads": getattr(config, "num_attention_heads", 0),
-            "max_position_embeddings": getattr(config, "max_position_embeddings", "N/A"),
-            "intermediate_size": getattr(config, "intermediate_size", "N/A"),
-            "source": "ModelScope",
-            "detail_calculation": detail_calculation,
-        }
-
-        return True, info, df_params, "", config
-    except Exception as e:
-        return False, None, None, str(e), None
+def cached_analyze_model_structure(model_id: str, trust_remote_code: bool):
+    return analyze_model_structure(model_id, trust_remote_code)
 
 
 # --- UI 布局 ---
@@ -526,7 +38,9 @@ with st.sidebar:
     )
 
     trust_remote = st.checkbox(
-        "Trust Remote Code", value=True, help="大多数ModelScope模型需要此选项，否则可能无法加载配置"
+        "Trust Remote Code",
+        value=True,
+        help="大多数ModelScope模型需要此选项，否则可能无法加载配置",
     )
 
     st.divider()
@@ -544,7 +58,10 @@ with st.sidebar:
     }
 
     context_choice = st.selectbox(
-        "上下文长度", options=list(context_options.keys()), index=4, help="选择预设长度或自定义"  # 默认选择 32K
+        "上下文长度",
+        options=list(context_options.keys()),
+        index=4,
+        help="选择预设长度或自定义",  # 默认选择 32K
     )
 
     if context_choice == "自定义":
@@ -558,8 +75,16 @@ with st.sidebar:
         )
     else:
         context_length = context_options[context_choice]
-    batch_size = st.number_input("批大小", value=8, min_value=1, step=1, help="推理时的批量大小")
-    tp = st.number_input("张量并行度 (TP)", value=2, min_value=1, step=1, help="模型并行度，通常用于多卡推理")
+    batch_size = st.number_input(
+        "批大小", value=8, min_value=1, step=1, help="推理时的批量大小"
+    )
+    tp = st.number_input(
+        "张量并行度 (TP)",
+        value=2,
+        min_value=1,
+        step=1,
+        help="模型并行度，通常用于多卡推理",
+    )
     dtype_select = st.selectbox(
         "KV Cache 数据类型",
         options=["fp16", "bf16", "fp32", "fp8", "int8", "int4"],
@@ -582,11 +107,17 @@ if run_btn and model_input:
         st.write(f"🔍 模型ID: {model_input}")
         st.write("📊 正在计算详细参数公式...")
 
-    success, info, df, error_msg, config = analyze_model_structure(model_input, trust_remote)
+    success, info, df, error_msg, config = analyze_model_structure(
+        model_input, trust_remote
+    )
 
     if success:
         elapsed_time = time.time() - start_time
-        status_container.update(label=f"✅ 分析完成！耗时 {elapsed_time:.2f}秒", state="complete", expanded=False)
+        status_container.update(
+            label=f"✅ 分析完成！耗时 {elapsed_time:.2f}秒",
+            state="complete",
+            expanded=False,
+        )
 
         # --- 主显示区域 ---
         tab_overview, tab_formula, tab_details, tab_viz = st.tabs(
@@ -608,6 +139,19 @@ if run_btn and model_input:
             col7.metric("中间层大小", info["intermediate_size"])
             col8.metric("最大序列长度", info["max_position_embeddings"])
 
+            val = info.get("validation")
+            if val and val.get("formula_total", 0) and val.get("actual_total", 0):
+                mcols = st.columns(3)
+                mcols[0].metric("公式总计", format_number(val["formula_total"]))
+                mcols[1].metric("实际枚举总计", format_number(val["actual_total"]))
+                mcols[2].metric(
+                    "差异", format_number(abs(val["delta"])) if val["delta"] else "0"
+                )
+                if not val.get("match", False):
+                    st.warning(
+                        "公式与实际枚举存在>1%的差异，请检查架构特殊项（Bias/共享权重/特殊归一化等）。"
+                    )
+
             # 显示MoE信息（如果适用）
             detail_info = info.get("detail_calculation", {})
             if "MoE信息" in detail_info:
@@ -622,7 +166,10 @@ if run_btn and model_input:
                 if "稀疏性" in moe_info:
                     col11.metric("稀疏率", moe_info["稀疏性"])
                 if "总计（激活参数）" in detail_info["详细计算"]:
-                    col12.metric("激活参数", format_number(detail_info["详细计算"]["总计（激活参数）"]))
+                    col12.metric(
+                        "激活参数",
+                        format_number(detail_info["详细计算"]["总计（激活参数）"]),
+                    )
 
             # 显示数据源
             st.info(f"📡 数据源: {info['source']}")
@@ -636,7 +183,9 @@ if run_btn and model_input:
 
             # --- KV Cache 显存 ---
             if info["num_layers"] > 0 and info["num_heads"] > 0:
-                kv_size, kv_steps = estimate_kv_cache(config, context_length, batch_size, dtype_select, tp)
+                kv_size, kv_steps = estimate_kv_cache(
+                    config, context_length, batch_size, dtype_select, tp
+                )
                 st.info(
                     f"⚡ KV Cache 显存估算 ({dtype_select}, context={context_length}, batch={batch_size}, TP={tp}): {kv_size}"
                 )
@@ -649,7 +198,9 @@ if run_btn and model_input:
                     with col_formula:
                         st.markdown("**计算公式:**")
                         # 使用更简洁的 LaTeX 公式并确保正确显示
-                        st.latex(r"""\text{KB} = \frac{L \times H \times D \times C \times 2 \times B \times S}{TP}""")
+                        st.latex(
+                            r"""\text{KB} = \frac{L \times H \times D \times C \times 2 \times B \times S}{TP}"""
+                        )
 
                     with col_explanation:
                         st.markdown("**变量说明:**")
@@ -679,105 +230,117 @@ if run_btn and model_input:
 
             detail_info = info.get("detail_calculation", {})
 
-            # 显示基础信息
+            # 基础信息表格
             if "基础信息" in detail_info:
                 st.write("### 模型配置信息")
                 base_info = detail_info["基础信息"]
-                info_cols = st.columns(3)
-                info_items = list(base_info.items())
+                base_rows = [
+                    {"项目": str(k), "值": str(v)} for k, v in base_info.items()
+                ]
+                df_base = pd.DataFrame(base_rows)
+                df_base["项目"] = df_base["项目"].astype(str)
+                df_base["值"] = df_base["值"].astype(str)
+                st.dataframe(df_base, width=1000)
 
-                for i in range(0, len(info_items), 3):
-                    for j in range(3):
-                        if i + j < len(info_items):
-                            key, value = info_items[i + j]
-                            info_cols[j].metric(key, value)
-
-            # 显示详细公式
+            # 结构化公式展示
             if "公式" in detail_info:
-                st.write("### 参数量计算公式推导")
+                st.write("### 分段公式")
 
-                # 创建一个可折叠的代码区域显示公式
-                formula_text = "\n".join(detail_info["公式"])
+                def parse_formula(lines):
+                    blocks = []
+                    current = {"title": None, "sections": [], "lines": []}
+                    sub = None
 
-                # 使用markdown显示公式，增强可读性
-                st.markdown(
-                    """
-                <style>
-                .formula-box {
-                    background-color: #f8f9fa;
-                    border-left: 4px solid #4e73df;
-                    padding: 1rem;
-                    margin: 1rem 0;
-                    border-radius: 0.25rem;
-                }
-                .formula-step {
-                    margin: 0.5rem 0;
-                    padding: 0.5rem;
-                    background-color: #ffffff;
-                    border-radius: 0.25rem;
-                }
-                </style>
-                """,
-                    unsafe_allow_html=True,
-                )
-
-                # 将公式文本分割成步骤显示
-                formula_lines = detail_info["公式"]
-                current_section = []
-
-                for line in formula_lines:
-                    if line.startswith("### "):
-                        # 显示之前的部分
-                        if current_section:
-                            st.markdown(
-                                f'<div class="formula-box">{"<br>".join(current_section)}</div>',
-                                unsafe_allow_html=True,
+                    def flush_sub():
+                        nonlocal sub, current
+                        if sub and sub.get("lines"):
+                            current["sections"].append(
+                                {"subtitle": sub["subtitle"], "lines": sub["lines"]}
                             )
-                            current_section = []
-                        # 新的大标题
-                        st.markdown(f"**{line[4:]}**")
-                    elif line.startswith("#### "):
-                        # 显示之前的部分
-                        if current_section:
-                            st.markdown(
-                                f'<div class="formula-step">{"<br>".join(current_section)}</div>',
-                                unsafe_allow_html=True,
-                            )
-                            current_section = []
-                        # 小标题
-                        st.markdown(f"*{line[5:]}*")
-                    elif line.strip():
-                        current_section.append(line)
+                            sub = None
 
-                # 显示最后的部分
-                if current_section:
-                    st.markdown(
-                        f'<div class="formula-step">{"<br>".join(current_section)}</div>', unsafe_allow_html=True
-                    )
+                    def flush_block():
+                        nonlocal current, blocks
+                        flush_sub()
+                        if current["title"] or current["lines"] or current["sections"]:
+                            blocks.append(current)
+                        current = {"title": None, "sections": [], "lines": []}
 
-                # 显示Latex公式总结
-                st.write("### 公式总结")
-                st.latex(
-                    r"""
+                    for raw in lines:
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        if line.startswith("### "):
+                            flush_block()
+                            current["title"] = line[4:]
+                        elif line.startswith("#### "):
+                            flush_sub()
+                            sub = {"subtitle": line[5:], "lines": []}
+                        else:
+                            if sub is not None:
+                                sub["lines"].append(line)
+                            else:
+                                current["lines"].append(line)
+                    flush_block()
+                    return blocks
+
+                blocks = parse_formula(detail_info["公式"])
+                for blk in blocks:
+                    if blk["title"]:
+                        st.markdown(f"**{blk['title']}**")
+                    if blk["lines"]:
+                        st.code("\n".join(blk["lines"]), language="text")
+                    for sec in blk["sections"]:
+                        st.markdown(f"*{sec['subtitle']}*")
+                        if sec["lines"]:
+                            st.code("\n".join(sec["lines"]), language="text")
+
+            # 关键分项表格
+            calc = detail_info.get("详细计算", {})
+            if calc:
+                st.write("### 关键分项")
+                rows = []
+                keys = [
+                    "Embedding参数",
+                    "每层Attention参数",
+                    "每层MoE总参数",
+                    "每层MLP参数",
+                    "每层归一化参数",
+                    "每层总参数(MoE)",
+                    "每层总参数(Dense)",
+                    "所有层总参数",
+                    "所有层激活参数",
+                    "LM Head参数",
+                    "总计",
+                    "总计（激活参数）",
+                ]
+                for k in keys:
+                    if k in calc:
+                        val = calc[k]
+                        try:
+                            if isinstance(val, (int, float)):
+                                sval = format_number(int(val))
+                            else:
+                                sval = str(val)
+                        except Exception:
+                            sval = str(val)
+                        rows.append({"项目": k, "值": sval})
+                if rows:
+                    df_rows = pd.DataFrame(rows)
+                    df_rows["项目"] = df_rows["项目"].astype(str)
+                    df_rows["值"] = df_rows["值"].astype(str)
+                    st.dataframe(df_rows, width=1000)
+
+            # LaTeX 总结（MoE/Dense）
+            st.write("### 公式总结")
+            st.latex(
+                r"""
                 \begin{aligned}
-                \text{总参数} &= \text{Embedding} + N \times (\text{Attention层} + \text{MLP层} + \text{LayerNorm层}) + \text{LM Head} \\
-                \text{Embedding} &= V \times H \\
-                \text{Attention层} &= 4 \times H^2 \\
-                \text{MLP层} &= 3 \times H \times I \quad (\text{Llama架构}) \\
-                \text{LayerNorm层} &= 4 \times H \\
-                \text{LM Head} &= H \times V
+                \text{Dense: } & \text{总} = V\cdot H + N \cdot (4H^2 + 3HI + \text{Norm}) + \text{LM} \\
+                \text{MoE: } & \text{总} = V\cdot H + N_{moe} \cdot (4H^2 + (H\cdot E_{gate} + 3H\sum_i E_i N_i) + \text{Norm}) + N_{dense} \cdot (4H^2 + 3HI + \text{Norm}) + \text{LM}
                 \end{aligned}
                 """
-                )
-
-                st.write("其中：")
-                st.write("- $V$ = 词表大小")
-                st.write("- $H$ = 隐藏层维度")
-                st.write("- $I$ = 中间层维度")
-                st.write("- $N$ = 层数")
-
-            else:
-                st.warning("未能生成详细计算公式")
+            )
 
         with tab_details:
             st.subheader("🔍 详细参数统计")
@@ -791,12 +354,22 @@ if run_btn and model_input:
                 cols = st.columns(1)
                 with cols[0]:
                     # 显示百分比
-                    type_stats["Percentage"] = (type_stats["Count"] / type_stats["Count"].sum() * 100).round(2)
-                    st.dataframe(type_stats[["ParamType", "Count", "Percentage"]], width="stretch")
+                    type_stats["Percentage"] = (
+                        type_stats["Count"] / type_stats["Count"].sum() * 100
+                    ).round(2)
+                    st.dataframe(
+                        type_stats[["ParamType", "Count", "Percentage"]],
+                        width="stretch",
+                    )
 
                 # 层参数统计
                 st.write("### 每层参数统计")
-                layer_stats = df[df["LayerIdx"] >= 0].groupby("LayerIdx")["Count"].sum().reset_index()
+                layer_stats = (
+                    df[df["LayerIdx"] >= 0]
+                    .groupby("LayerIdx")["Count"]
+                    .sum()
+                    .reset_index()
+                )
                 layer_stats = layer_stats.sort_values("LayerIdx")
 
                 if not layer_stats.empty:
@@ -809,7 +382,11 @@ if run_btn and model_input:
 
                 # 详细参数表
                 st.write("### 完整参数列表")
-                st.dataframe(df[["Full Name", "Shape", "Count", "ParamType", "LayerIdx"]], width="stretch", height=500)
+                st.dataframe(
+                    df[["Full Name", "Shape", "Count", "ParamType", "LayerIdx"]],
+                    width="stretch",
+                    height=500,
+                )
             else:
                 st.warning("未能解析出详细参数结构。")
 
@@ -822,13 +399,24 @@ if run_btn and model_input:
 
                 with col1:
                     type_df = df.groupby("ParamType")["Count"].sum().reset_index()
-                    fig1 = px.pie(type_df, values="Count", names="ParamType", title="参数类型分布", hole=0.3)
+                    fig1 = px.pie(
+                        type_df,
+                        values="Count",
+                        names="ParamType",
+                        title="参数类型分布",
+                        hole=0.3,
+                    )
                     st.plotly_chart(fig1, width="stretch")
 
                 with col2:
                     # 2. 层级分布条形图
                     if df["LayerIdx"].max() > 0:
-                        layer_df = df[df["LayerIdx"] >= 0].groupby("LayerIdx")["Count"].sum().reset_index()
+                        layer_df = (
+                            df[df["LayerIdx"] >= 0]
+                            .groupby("LayerIdx")["Count"]
+                            .sum()
+                            .reset_index()
+                        )
                         fig2 = px.bar(
                             layer_df,
                             x="LayerIdx",
@@ -840,12 +428,22 @@ if run_btn and model_input:
 
                 # 3. Treemap
                 st.write("### 层级结构分布图")
-                df_grouped = df.groupby(["Group", "LayerIdx", "SubGroup", "ParamType"])["Count"].sum().reset_index()
+                df_grouped = (
+                    df.groupby(["Group", "LayerIdx", "SubGroup", "ParamType"])["Count"]
+                    .sum()
+                    .reset_index()
+                )
                 df_grouped = df_grouped.sort_values(["Group", "LayerIdx"])
 
                 fig3 = px.treemap(
                     df_grouped,
-                    path=[px.Constant(model_input), "Group", "LayerIdx", "ParamType", "SubGroup"],
+                    path=[
+                        px.Constant(model_input),
+                        "Group",
+                        "LayerIdx",
+                        "ParamType",
+                        "SubGroup",
+                    ],
                     values="Count",
                     color="LayerIdx",
                     hover_data=["Count", "ParamType"],
@@ -862,7 +460,9 @@ if run_btn and model_input:
 
         if "404" in error_msg or "not found" in error_msg.lower():
             st.warning("请检查模型 ID 是否拼写正确，或者该模型是否存在。")
-            st.markdown("🔍 你可以在 [ModelScope](https://modelscope.cn/models) 搜索模型")
+            st.markdown(
+                "🔍 你可以在 [ModelScope](https://modelscope.cn/models) 搜索模型"
+            )
 
         if "trust_remote_code" in error_msg:
             st.warning("ModelScope模型通常需要Trust Remote Code选项，请确保已勾选。")
