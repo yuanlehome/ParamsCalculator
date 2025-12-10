@@ -19,4 +19,3 @@ Code style:
 Tests:
 - Add minimal scripts in `scripts/` for reproductions
 - Validate formula totals against enumerated parameters
-

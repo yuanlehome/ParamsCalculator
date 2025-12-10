@@ -1,19 +1,18 @@
+import json
 import os
 import re
-import json
 import sqlite3
 import time
-import transformers
-from accelerate import init_empty_weights
-import numpy as np
-import torch
-from params_calculator.common import ALIASES
 from typing import Any, Tuple
 
+import numpy as np
 import pandas as pd
+import torch
+import transformers
+from accelerate import init_empty_weights
 from modelscope import AutoConfig, AutoModel
 
-from params_calculator.common import format_number
+from params_calculator.common import ALIASES, format_number
 
 
 def extract_layer_index(name: str) -> int:

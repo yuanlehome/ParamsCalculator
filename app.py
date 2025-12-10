@@ -1,10 +1,12 @@
 import time
+
+import pandas as pd
 import plotly.express as px
 import streamlit as st
-import pandas as pd
-from params_calculator.common import format_number, get_dtype_size
-from params_calculator.memory import estimate_vram, estimate_kv_cache
+
 from params_calculator.analysis import analyze_model_structure
+from params_calculator.common import format_number, get_dtype_size
+from params_calculator.memory import estimate_kv_cache, estimate_vram
 
 # --- 页面配置 ---
 st.set_page_config(
